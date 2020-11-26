@@ -4,7 +4,30 @@ require 'bundler/setup'
 require 'sidekiq'
 require 'sidekiq-pro'
 require 'sidekiq/batch'
+require 'tempfile'
 
+module ReducerFunctions
+  module FileSum
+    # sig { params(file_paths: T::Array[String], blk: T.proc.returns(String)).void }
+    def self.reduce(file_paths, &blk)
+      result = file_paths.reduce(0) { |accumulator, filepath| accumulator += Integer(File.read(filepath)) }.to_s
+
+      temp = Tempfile.new
+      temp.write(result)
+      temp.close
+
+      yield temp.path
+    ensure
+      temp.unlink
+    end
+
+    # This probably shouldn't exist, and should be left to the utility-level
+    # sig { params(file_paths: T::Array[String]).returns(String) }
+    def self.next_file_name(file_names)
+      file_names.join("+")
+    end
+  end
+end
 
 class FileCombinerWorker
   include Sidekiq::Worker
@@ -15,13 +38,13 @@ class FileCombinerWorker
     puts "Starting worker to combine #{filepaths.inspect}"
 
     file_names = filepaths.map { |filepath| Pathname.new(filepath).basename.to_s }
-    result = filepaths.reduce(0) { |accumulator, filepath| accumulator += Integer(File.read(filepath)) }
-
-    output_file = File.join(destination_dir, file_names.join("+"))
+    output_file = File.join(destination_dir, ReducerFunctions::FileSum.next_file_name(file_names))
     raise "#{output_file} already exists" if File.exists?(output_file)
 
-    puts "Finishing worker by touching #{output_file}"
-    File.write(output_file, result)
+    ReducerFunctions::FileSum.reduce(filepaths) do |temp_output_path|
+      puts "Finishing worker by touching #{output_file}"
+      FileUtils.cp(temp_output_path, output_file)
+    end
   end
 
   private
